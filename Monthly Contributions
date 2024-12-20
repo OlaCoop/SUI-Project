@@ -1,0 +1,118 @@
+use sui_sdk::{AccountAddress, SuiResult, MoveValue};
+use std::collections::HashMap;
+
+pub struct ContributionPool {
+    // Maps user addresses to their contribution history.
+    contributions: HashMap<AccountAddress, Vec<(u64, bool)>>, // (month, contributed?)
+    total_pool: u64, // Total funds in the pool.
+    liquidity_checks: HashMap<AccountAddress, bool>, // Eligibility based on liquidity.
+    loans: HashMap<AccountAddress, u64>, // Active loans per user.
+    approvals: HashMap<AccountAddress, Vec<AccountAddress>>, // Co-sign approvals.
+}
+
+impl ContributionPool {
+    pub fn new() -> Self {
+        ContributionPool {
+            contributions: HashMap::new(),
+            total_pool: 0,
+            liquidity_checks: HashMap::new(),
+            loans: HashMap::new(),
+            approvals: HashMap::new(),
+        }
+    }
+
+    // Register a user's liquidity status.
+    pub fn register_liquidity(&mut self, user: AccountAddress, has_liquidity: bool) {
+        self.liquidity_checks.insert(user, has_liquidity);
+    }
+
+    // Add monthly contribution.
+    pub fn contribute(&mut self, user: AccountAddress, amount: u64, month: u64) -> SuiResult<()> {
+        if amount <= 0 {
+            return Err("Contribution amount must be greater than 0".into());
+        }
+
+        // Check liquidity eligibility.
+        if !self.liquidity_checks.get(&user).unwrap_or(&false) {
+            return Err("User is not eligible due to insufficient liquidity history".into());
+        }
+
+        // Update contributions.
+        self.contributions.entry(user).or_insert(Vec::new()).push((month, true));
+        self.total_pool += amount;
+        Ok(())
+    }
+
+    // Check if user can draw a loan.
+    pub fn can_draw_loan(&self, user: &AccountAddress) -> bool {
+        if let Some(history) = self.contributions.get(user) {
+            // Check if the user has contributed for 6 consecutive months.
+            if history.len() >= 6 && history.iter().all(|&(_, contributed)| contributed) {
+                return true;
+            }
+        }
+        false
+    }
+
+    // Request a loan.
+    pub fn request_loan(&mut self, user: AccountAddress, amount: u64, co_signers: Vec<AccountAddress>) -> SuiResult<()> {
+        if !self.can_draw_loan(&user) {
+            return Err("User is not eligible for a loan".into());
+        }
+
+        if co_signers.len() < 2 {
+            return Err("At least two co-signers are required".into());
+        }
+
+        for co_signer in &co_signers {
+            if !self.can_draw_loan(co_signer) {
+                return Err("One or more co-signers are not eligible".into());
+            }
+        }
+
+        if amount > self.total_pool {
+            return Err("Insufficient funds in the pool".into());
+        }
+
+        self.loans.insert(user, amount);
+        self.approvals.insert(user, co_signers);
+        self.total_pool -= amount;
+        Ok(())
+    }
+
+    // Approve a loan by co-signers.
+    pub fn approve_loan(&mut self, user: AccountAddress, co_signer: AccountAddress) -> SuiResult<()> {
+        if let Some(co_signers) = self.approvals.get_mut(&user) {
+            if co_signers.contains(&co_signer) {
+                co_signers.retain(|&signer| signer != co_signer);
+                if co_signers.is_empty() {
+                    return Ok(()); // All approvals completed.
+                }
+            } else {
+                return Err("Co-signer is not part of the original approval list".into());
+            }
+        }
+
+        Err("No loan approval request found for the user".into())
+    }
+
+    // Repay a loan.
+    pub fn repay_loan(&mut self, user: AccountAddress, amount: u64) -> SuiResult<()> {
+        if let Some(balance) = self.loans.get_mut(&user) {
+            if amount > *balance {
+                return Err("Repayment amount exceeds loan balance".into());
+            }
+
+            *balance -= amount;
+            self.total_pool += amount;
+
+            if *balance == 0 {
+                self.loans.remove(&user);
+            }
+
+            return Ok(());
+        }
+
+        Err("No active loan found for the user".into())
+    }
+}
